@@ -32,6 +32,10 @@ impl Server {
             while !stopped.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Windows can inherit the listener's nonblocking mode.
+                        // A timeout does not switch it back: explicitly make
+                        // accepted sockets blocking before reading HTTP headers.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
@@ -42,6 +46,12 @@ impl Server {
                                 Ok(0) | Err(_) => break,
                                 Ok(count) => header.extend_from_slice(&chunk[..count]),
                             }
+                        }
+                        // A timeout/EOF or shutdown wakeup is not an HTTP request.
+                        // Never reply and close while the client still has an
+                        // incomplete request: unread data can cause a TCP reset.
+                        if !header.ends_with(b"\r\n\r\n") {
+                            continue;
                         }
                         let request = String::from_utf8_lossy(&header).into_owned();
                         let path = request
@@ -218,4 +228,30 @@ fn unreachable_handshake_fails_within_configured_timeout() {
     assert!(client.start().is_err());
     assert!(start.elapsed() < Duration::from_secs(1));
     assert!(!client.running());
+}
+
+#[test]
+fn fixture_waits_for_delayed_fragmented_request_before_responding() {
+    let server = Server::new();
+    server.set("get_clock", "fixture-clock");
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    // Exercise the accepted socket before there is anything to read. On
+    // Windows a nonblocking accepted socket used to produce WouldBlock and
+    // the fixture replied/closed before reqwest could send its request.
+    thread::sleep(Duration::from_millis(30));
+    assert!(server.requests.lock().unwrap().is_empty());
+    stream
+        .write_all(b"GET /query?script=get_clock HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(15));
+    assert!(server.requests.lock().unwrap().is_empty());
+    stream.write_all(b"\r\n").unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 Fixture\r\n"));
+    assert!(response.ends_with("fixture-clock"));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
 }
